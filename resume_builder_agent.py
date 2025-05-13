@@ -4,8 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain.chat_models import ChatOpenAI
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
-from langchain.vectorstores import FAISS
-from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import OpenAIEmbeddings
 from docx import Document as DocxDocument
 from docx.shared import Pt, Inches
 from docx2pdf import convert
@@ -206,3 +206,6 @@ async def rewrite_resume(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("resume_builder_agent:app", host="0.0.0.0", port=10000)# Placeholder for resume_builder_agent.py content
+=======
+# Placeholder for resume_builder_agent.py content
+>>>>>>> 03569d7 (Initial commit)
