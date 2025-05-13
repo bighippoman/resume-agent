@@ -5,7 +5,7 @@ from langchain.chat_models import ChatOpenAI
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from docx import Document as DocxDocument
 from docx.shared import Pt, Inches
 from docx2pdf import convert
@@ -23,7 +23,7 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 embedding_model = OpenAIEmbeddings()
-vectorstore = FAISS.load_local("resume_lines_faiss_index", embedding_model)
+vectorstore = FAISS.load_local("resume_lines_faiss_index", embedding_model, allow_dangerous_deserialization=True)
 
 resume_prompt = PromptTemplate(
     input_variables=["resume_text", "job_desc", "retrieved_lines", "retrieved_count", "tone"],
