@@ -62,7 +62,7 @@ If company_name is empty, simply reference the role and industry.
 """
 )
 
-def build_resume_prompt_safe(resume_text, job_desc, retrieved_docs, tone="confident", model_name="gpt-4", max_input_tokens=3000):
+def build_resume_prompt_safe(resume_text, job_desc, retrieved_docs, tone="confident", model_name="gpt-4o-mini", max_input_tokens=6000):
     encoding = tiktoken.encoding_for_model(model_name)
     base_tokens = len(encoding.encode(resume_text + job_desc))
     safe_lines, token_total = [], base_tokens
