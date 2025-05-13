@@ -1,11 +1,9 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_community.chat_models import ChatOpenAI
+from langchain.chat_models import ChatOpenAI
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
 from docx import Document as DocxDocument
 from docx.shared import Pt, Inches
 from docx2pdf import convert
@@ -14,7 +12,6 @@ import tempfile, os, shutil, zipfile, smtplib
 from email.message import EmailMessage
 import docx2txt
 import fitz
-import tiktoken
 
 load_dotenv()
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
@@ -22,37 +19,32 @@ os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-embedding_model = OpenAIEmbeddings()
-vectorstore = FAISS.load_local("resume_lines_faiss_index", embedding_model, allow_dangerous_deserialization=True)
-
 resume_prompt = PromptTemplate(
-    input_variables=["resume_text", "job_desc", "retrieved_lines", "retrieved_count", "tone"],
+    input_variables=["resume_data", "job_desc", "tone"],
     template="""
 You are an expert resume coach.
+
 The user is applying for the following role:
 [JOB DESCRIPTION]
 {job_desc}
 
-Here is the user's current resume:
-[RESUME TEXT]
-{resume_text}
+Here is the user's structured resume data:
+{resume_data}
 
-You may use inspiration from these top {retrieved_count} strong resume bullet points:
-[EXAMPLE BULLETS]
-{retrieved_lines}
+Your task is to rewrite or improve their resume bullet points.
+Use a {tone} tone. Include action verbs, measurable outcomes, and skills relevant to the job description.
 
-Please revise only the most important bullet points in the resume.
-Focus on aligning with the job description using relevant skills, action verbs, and achievements.
-Use a tone that is {tone}. Output only the revised bullet points in bullet format.
+Return the improved resume in professional bullet point format, organized into appropriate sections (e.g., Experience, Education, Skills).
+Do not include extraneous commentary or explanations. Just output the improved resume.
 """
 )
 
 cover_prompt = PromptTemplate(
-    input_variables=["resume_text", "job_desc", "tone", "company_name", "recipient_name"],
+    input_variables=["resume_data", "job_desc", "tone", "company_name", "recipient_name"],
     template="""
 You are a professional career assistant.
-Based on the following resume:
-{resume_text}
+Based on the following structured resume:
+{resume_data}
 And this job description:
 {job_desc}
 Write a tailored cover letter in a {tone} tone.
@@ -62,35 +54,22 @@ If company_name is empty, simply reference the role and industry.
 """
 )
 
-def build_resume_prompt_safe(resume_text, job_desc, retrieved_docs, tone="confident", model_name="gpt-4o-mini", max_input_tokens=6000):
-    encoding = tiktoken.encoding_for_model(model_name)
-    base_tokens = len(encoding.encode(resume_text + job_desc))
-    safe_lines, token_total = [], base_tokens
-    for doc in retrieved_docs:
-        line = doc.page_content.strip()
-        line_tokens = len(encoding.encode(line))
-        if token_total + line_tokens > max_input_tokens:
-            break
-        safe_lines.append(line)
-        token_total += line_tokens
-    input_data = {
-        "resume_text": resume_text,
+def build_resume_prompt_safe(resume_data, job_desc, tone="confident"):
+    llm = ChatOpenAI(model_name="gpt-4o", temperature=0.5)
+    return LLMChain(llm=llm, prompt=resume_prompt).run({
+        "resume_data": resume_data,
         "job_desc": job_desc,
-        "retrieved_lines": "\n".join(safe_lines),
-        "retrieved_count": len(safe_lines),
         "tone": tone
-    }
-    llm = ChatOpenAI(model_name=model_name, temperature=0.5)
-    return LLMChain(llm=llm, prompt=resume_prompt).run(input_data)
+    })
 
-def build_cover_letter(resume_text, job_desc, tone, company_name, recipient_name):
+def build_cover_letter(resume_data, job_desc, tone, company_name, recipient_name):
     if not recipient_name.strip(): recipient_name = "Dear Hiring Manager"
     if not company_name.strip(): company_name = ""
     return LLMChain(
         llm=ChatOpenAI(model_name="gpt-4", temperature=0.5),
         prompt=cover_prompt
     ).run({
-        "resume_text": resume_text,
+        "resume_data": resume_data,
         "job_desc": job_desc,
         "tone": tone,
         "company_name": company_name,
@@ -148,8 +127,7 @@ async def rewrite_resume(
     preview: str = Form("true")
 ):
     resume_text = extract_text(resume)
-    retrieved_docs = vectorstore.similarity_search(job_desc, k=20)
-    resume_result = build_resume_prompt_safe(resume_text, job_desc, retrieved_docs, tone=tone)
+    resume_result = build_resume_prompt_safe(resume_text, job_desc, tone=tone)
     cover_result = build_cover_letter(resume_text, job_desc, tone, company_name, recipient_name)
 
     if preview.lower() == "true":
@@ -161,7 +139,7 @@ async def rewrite_resume(
     resume_doc = DocxDocument(); style_doc(resume_doc)
     resume_doc.add_paragraph(sender_name).bold = True
     resume_doc.add_paragraph(f"Email: {sender_email} | Phone: {sender_phone}")
-    resume_doc.add_paragraph(""); resume_doc.add_heading("Rewritten Resume Bullets", level=1)
+    resume_doc.add_paragraph(""); resume_doc.add_heading("Rewritten Resume", level=1)
     for line in resume_result.splitlines():
         clean = line.lstrip("-•\u2022* ").strip()
         if clean: resume_doc.add_paragraph(clean, style='List Bullet')
@@ -205,5 +183,4 @@ async def rewrite_resume(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("resume_builder_agent:app", host="0.0.0.0", port=10000)# Placeholder for resume_builder_agent.py content
-
+    uvicorn.run("resume_builder_agent:app", host="0.0.0.0", port=10000)
