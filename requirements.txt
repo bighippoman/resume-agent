@@ -2,6 +2,7 @@ fastapi
 uvicorn
 openai
 langchain
+langchain-community
 python-docx
 docx2pdf
 tiktoken
