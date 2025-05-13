@@ -1,3 +1,8 @@
+"""
+Resume Builder Agent – v2.1
+Adds Pydantic schema validation for safer JSON handling.
+"""
+
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +13,9 @@ from docx import Document as DocxDocument
 from docx.shared import Pt, Inches
 from docx2pdf import convert
 from dotenv import load_dotenv
-import tempfile, os, shutil, zipfile, smtplib
+from pydantic import BaseModel, ValidationError
+from typing import List
+import tempfile, os, shutil, zipfile, smtplib, json, logging
 from email.message import EmailMessage
 import docx2txt
 import fitz
@@ -16,104 +23,175 @@ import fitz
 load_dotenv()
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 
+logging.basicConfig(level=logging.INFO)
+
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ───────────────────────── Pydantic models ──────────────────────────
+class ResumeHeader(BaseModel):
+    name: str
+    email: str
+    phone: str
+
+class ResumeExperience(BaseModel):
+    title: str
+    company: str
+    dates: str
+    bullets: List[str]
+
+class ResumeEducation(BaseModel):
+    degree: str
+    institution: str
+    dates: str
+
+class ResumeJSON(BaseModel):
+    header: ResumeHeader
+    summary: str
+    experience: List[ResumeExperience]
+    education: List[ResumeEducation]
+    skills: List[str]
+
+# ───────────────────────── PROMPTS ──────────────────────────
 resume_prompt = PromptTemplate(
     input_variables=["resume_data", "job_desc", "tone"],
     template="""
-You are an expert resume coach.
-
-The user is applying for the following role:
-[JOB DESCRIPTION]
-{job_desc}
-
-Here is the user's structured resume data:
-{resume_data}
-
-Your task is to rewrite or improve their resume bullet points.
-Use a {tone} tone. Include action verbs, measurable outcomes, and skills relevant to the job description.
-
-Return the improved resume in professional bullet point format, organized into appropriate sections (e.g., Experience, Education, Skills).
-Do not include extraneous commentary or explanations. Just output the improved resume.
-"""
+SYSTEM:\nYou are “ResumeRevamp-GPT”, a former Fortune‑500 recruiter.\n\nRULES:\n1. Do not fabricate education, employers, dates, or metrics.\n2. Use only facts that appear in either the candidate résumé (below) or the job description.\n3. Each bullet must begin with an action verb, include a metric, and finish with a skill or tool.\n4. Tone = {tone}. Acceptable values: formal | modern | confident | impactful.\n5. \u22646 bullets per job, \u226415 words per bullet.\n6. Return **valid JSON only** matching the schema – no markdown, no comments.\n\nSCHEMA:\n{\n  \"header\": {\"name\":\"\", \"email\":\"\", \"phone\":\"\"},\n  \"summary\": \"\",\n  \"experience\": [\n     {\"title\":\"\", \"company\":\"\", \"dates\":\"\", \"bullets\":[\"\"]}\n  ],\n  \"education\": [\n     {\"degree\":\"\", \"institution\":\"\", \"dates\":\"\"}\n  ],\n  \"skills\": [\"\"]\n}\n\n[JOB DESCRIPTION]\n{job_desc}\n\n[CANDIDATE RÉSUMÉ]\n{resume_data}\n"""
 )
 
 cover_prompt = PromptTemplate(
     input_variables=["resume_data", "job_desc", "tone", "company_name", "recipient_name"],
     template="""
-You are a professional career assistant.
-Based on the following structured resume:
-{resume_data}
-And this job description:
-{job_desc}
-Write a tailored cover letter in a {tone} tone.
-Address it to {recipient_name} at {company_name}.
-If recipient_name is empty, address it to "Dear Hiring Manager".
-If company_name is empty, simply reference the role and industry.
-"""
+SYSTEM: You are “CoverCraft-GPT”, a career coach who crafts concise, story‑driven cover letters.\n\nINSTRUCTIONS:\n1. 250–300 words, four paragraphs (hook, alignment, value, close).\n2. Mirror 5–7 keywords from the job description verbatim.\n3. Mention ONE achievement from the résumé.\n4. Close with a polite call‑to‑action.\n\nRecipient = {recipient_name or \"Hiring Manager\"}\nCompany  = {company_name or \"your organisation\"}\nTone     = {tone}\n\n[JOB DESCRIPTION]\n{job_desc}\n\n[RÉSUMÉ]\n{resume_data}\n"""
 )
 
-def build_resume_prompt_safe(resume_data, job_desc, tone="confident"):
-    llm = ChatOpenAI(model_name="gpt-4o", temperature=0.5)
-    return LLMChain(llm=llm, prompt=resume_prompt).run({
-        "resume_data": resume_data,
-        "job_desc": job_desc,
-        "tone": tone
-    })
+# ───────────────────────── UTILITIES ──────────────────────────
 
-def build_cover_letter(resume_data, job_desc, tone, company_name, recipient_name):
-    if not recipient_name.strip(): recipient_name = "Dear Hiring Manager"
-    if not company_name.strip(): company_name = ""
-    return LLMChain(
-        llm=ChatOpenAI(model_name="gpt-4", temperature=0.5),
-        prompt=cover_prompt
-    ).run({
-        "resume_data": resume_data,
-        "job_desc": job_desc,
-        "tone": tone,
-        "company_name": company_name,
-        "recipient_name": recipient_name
-    })
-
-def style_doc(doc):
+def style_doc(doc: DocxDocument):
     font = doc.styles['Normal'].font
-    font.name = 'Georgia'; font.size = Pt(11)
+    font.name = 'Georgia'
+    font.size = Pt(11)
     for section in doc.sections:
-        section.top_margin = Inches(0.75); section.bottom_margin = Inches(0.75)
-        section.left_margin = Inches(1.0); section.right_margin = Inches(1.0)
+        section.top_margin = Inches(0.75)
+        section.bottom_margin = Inches(0.75)
+        section.left_margin = Inches(1.0)
+        section.right_margin = Inches(1.0)
 
-def extract_text(file: UploadFile):
-    suffix = file.filename.split(".")[-1].lower()
+def extract_text(file: UploadFile) -> str:
+    suffix = file.filename.split('.')[-1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
         shutil.copyfileobj(file.file, tmp)
         path = tmp.name
-    if suffix == "pdf":
-        text = "\n".join([page.get_text() for page in fitz.open(path)])
-    elif suffix in ["docx", "doc"]:
-        text = docx2txt.process(path)
-    elif suffix == "txt":
-        text = open(path, "r", encoding="utf-8").read()
-    else:
-        text = ""
-    os.unlink(path)
+    try:
+        if suffix == 'pdf':
+            text = "\n".join([page.get_text() for page in fitz.open(path)])
+        elif suffix in ['docx', 'doc']:
+            text = docx2txt.process(path)
+        elif suffix == 'txt':
+            text = open(path, 'r', encoding='utf-8').read()
+        else:
+            text = ""
+    finally:
+        os.unlink(path)
     return text
 
-def email_resume_package(to, from_email, subject, message, attachments):
+# ───────────────────────── LLM CALLS ──────────────────────────
+
+def build_resume_struct(resume_data: str, job_desc: str, tone: str = 'confident') -> dict:
+    llm = ChatOpenAI(model_name="gpt-4o", temperature=0.4)
+    raw_json = LLMChain(llm=llm, prompt=resume_prompt).run({
+        'resume_data': resume_data,
+        'job_desc': job_desc,
+        'tone': tone
+    })
+    try:
+        struct = json.loads(raw_json)
+        # Validate against schema
+        ResumeJSON(**struct)
+    except (json.JSONDecodeError, ValidationError) as e:
+        logging.error(f"Schema validation failed: {e}")
+        struct = {"raw": raw_json}
+    return struct
+
+def build_cover_letter(resume_data: str, job_desc: str, tone: str, company_name: str, recipient_name: str) -> str:
+    if not recipient_name.strip():
+        recipient_name = "Hiring Manager"
+    if not company_name.strip():
+        company_name = ""
+    llm = ChatOpenAI(model_name="gpt-4o", temperature=0.5)
+    return LLMChain(llm=llm, prompt=cover_prompt).run({
+        'resume_data': resume_data,
+        'job_desc': job_desc,
+        'tone': tone,
+        'company_name': company_name,
+        'recipient_name': recipient_name
+    })
+
+# ───────────────────────── DOCX BUILDERS ──────────────────────────
+
+def docx_from_struct(data: dict) -> DocxDocument:
+    doc = DocxDocument()
+    style_doc(doc)
+
+    header = data.get('header', {})
+    doc.add_paragraph(header.get('name', '')).bold = True
+    contact_line = " | ".join(filter(None, [
+        f"Email: {header.get('email', '')}" if header.get('email') else '',
+        f"Phone: {header.get('phone', '')}" if header.get('phone') else ''
+    ]))
+    if contact_line:
+        doc.add_paragraph(contact_line)
+
+    if summary := data.get('summary'):
+        doc.add_paragraph('')
+        doc.add_heading('Professional Summary', level=2)
+        doc.add_paragraph(summary.strip())
+
+    if exps := data.get('experience'):
+        doc.add_paragraph('')
+        doc.add_heading('Experience', level=2)
+        for role in exps:
+            title_line = f"{role.get('title', '')} – {role.get('company', '')} ({role.get('dates', '')})"
+            doc.add_paragraph(title_line).bold = True
+            for b in role.get('bullets', []):
+                if b.strip():
+                    doc.add_paragraph(b.strip(), style='List Bullet')
+
+    if edus := data.get('education'):
+        doc.add_paragraph('')
+        doc.add_heading('Education', level=2)
+        for ed in edus:
+            edu_line = f"{ed.get('degree', '')}, {ed.get('institution', '')} ({ed.get('dates', '')})"
+            doc.add_paragraph(edu_line)
+
+    if skills := data.get('skills'):
+        doc.add_paragraph('')
+        doc.add_heading('Skills', level=2)
+        doc.add_paragraph(', '.join(skills))
+
+    return doc
+
+# ───────────────────────── EMAIL ──────────────────────────
+
+def email_resume_package(to: str, from_email: str, subject: str, message: str, attachments: List[str]):
     msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = from_email
-    msg["To"] = to
+    msg['Subject'] = subject
+    msg['From'] = from_email
+    msg['To'] = to
     msg.set_content(message)
     for path in attachments:
-        with open(path, "rb") as f:
-            msg.add_attachment(f.read(), maintype="application", subtype="octet-stream", filename=os.path.basename(path))
-    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        with open(path, 'rb') as f:
+            msg.add_attachment(
+                f.read(), maintype='application', subtype='octet-stream', filename=os.path.basename(path)
+            )
+    with smtplib.SMTP('smtp.gmail.com', 587) as smtp:
         smtp.starttls()
-        smtp.login(os.getenv("SMTP_EMAIL"), os.getenv("SMTP_PASSWORD"))
+        smtp.login(os.getenv('SMTP_EMAIL'), os.getenv('SMTP_PASSWORD'))
         smtp.send_message(msg)
 
-@app.post("/rewrite")
+# ───────────────────────── ENDPOINT ──────────────────────────
+
+@app.post('/rewrite')
 async def rewrite_resume(
     resume: UploadFile = File(...),
     tone: str = Form(...),
@@ -123,64 +201,4 @@ async def rewrite_resume(
     sender_name: str = Form(...),
     sender_email: str = Form(...),
     sender_phone: str = Form(...),
-    email_to: str = Form(None),
-    preview: str = Form("true")
-):
-    resume_text = extract_text(resume)
-    resume_result = build_resume_prompt_safe(resume_text, job_desc, tone=tone)
-    cover_result = build_cover_letter(resume_text, job_desc, tone, company_name, recipient_name)
-
-    if preview.lower() == "true":
-        return JSONResponse({
-            "resume_text": resume_result.strip(),
-            "cover_letter": cover_result.strip()
-        })
-
-    resume_doc = DocxDocument(); style_doc(resume_doc)
-    resume_doc.add_paragraph(sender_name).bold = True
-    resume_doc.add_paragraph(f"Email: {sender_email} | Phone: {sender_phone}")
-    resume_doc.add_paragraph(""); resume_doc.add_heading("Rewritten Resume", level=1)
-    for line in resume_result.splitlines():
-        clean = line.lstrip("-•\u2022* ").strip()
-        if clean: resume_doc.add_paragraph(clean, style='List Bullet')
-
-    cover_doc = DocxDocument(); style_doc(cover_doc)
-    cover_doc.add_paragraph(sender_name).bold = True
-    cover_doc.add_paragraph(f"Email: {sender_email} | Phone: {sender_phone}")
-    cover_doc.add_paragraph(""); cover_doc.add_heading("Cover Letter", level=1)
-    for paragraph in cover_result.split("\n"):
-        if paragraph.strip(): cover_doc.add_paragraph(paragraph.strip())
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        resume_path = os.path.join(temp_dir, "resume.docx")
-        cover_path = os.path.join(temp_dir, "cover_letter.docx")
-        zip_path = os.path.join(temp_dir, "resume_package.zip")
-
-        resume_doc.save(resume_path); cover_doc.save(cover_path)
-        convert(resume_path, resume_path.replace(".docx", ".pdf"))
-        convert(cover_path, cover_path.replace(".docx", ".pdf"))
-
-        if email_to:
-            email_resume_package(
-                to=email_to, from_email=sender_email,
-                subject="Your Resume + Cover Letter Package",
-                message="Attached are your generated files.",
-                attachments=[
-                    resume_path,
-                    cover_path,
-                    resume_path.replace(".docx", ".pdf"),
-                    cover_path.replace(".docx", ".pdf")
-                ]
-            )
-
-        with zipfile.ZipFile(zip_path, 'w') as zipf:
-            zipf.write(resume_path)
-            zipf.write(cover_path)
-            zipf.write(resume_path.replace(".docx", ".pdf"))
-            zipf.write(cover_path.replace(".docx", ".pdf"))
-
-        return FileResponse(zip_path, media_type="application/zip", filename="resume_package.zip")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("resume_builder_agent:app", host="0.0.0.0", port=10000)
+    email_to: str | None =
