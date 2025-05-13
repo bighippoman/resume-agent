@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+openai
+langchain
+python-docx
+docx2pdf
+tiktoken
+python-dotenv
+docx2txt
+PyMuPDF
