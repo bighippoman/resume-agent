@@ -12,3 +12,4 @@ tiktoken
 python-dotenv
 docx2txt
 PyMuPDF
+python-multipart
