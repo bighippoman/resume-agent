@@ -24,7 +24,11 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://neuralstock.ai",
+        "https://www.neuralstock.ai"
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
