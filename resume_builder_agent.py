@@ -1,7 +1,3 @@
-Resume Builder Agent – v2.2
-Switched to `langchain_community` import to silence deprecation warning and added a simple health‑check root route. Includes strict schema validation using Pydantic and fallback handling.
-
-```python
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +14,7 @@ import tempfile, os, shutil, zipfile, smtplib, json, logging
 from email.message import EmailMessage
 import docx2txt
 import fitz
+from ats_audit import audit_resume
 
 load_dotenv()
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
@@ -213,4 +210,82 @@ def email_resume_package(to_addr: str, from_addr: str, subject: str, body: str, 
         server.starttls()
         server.login(os.getenv("SMTP_EMAIL"), os.getenv("SMTP_PASSWORD"))
         server.send_message(msg)
-```
+
+@app.post("/rewrite")
+async def rewrite_resume(
+    resume: UploadFile = File(...),
+    tone: str = Form(...),
+    job_desc: str = Form(...),
+    company_name: str = Form(...),
+    recipient_name: str = Form(...),
+    sender_name: str = Form(...),
+    sender_email: str = Form(...),
+    sender_phone: str = Form(...),
+    email_to: Optional[str] = Form(None),
+    preview: str = Form("true")
+):
+    resume_text = extract_text(resume)
+    resume_struct = build_resume_struct(resume_text, job_desc, tone)
+    cover_text = build_cover_letter(resume_text, job_desc, tone, company_name, recipient_name)
+
+    if preview.lower() == "true":
+        audit_result = audit_resume(resume_struct, job_desc) if "raw" not in resume_struct else {}
+        return JSONResponse({
+            "resume_json": resume_struct,
+            "cover_letter": cover_text.strip(),
+            "ats_audit": audit_result
+        })
+
+    if "raw" in resume_struct:
+        resume_doc = DocxDocument()
+        resume_doc.add_paragraph(resume_struct["raw"])
+    else:
+        resume_doc = docx_from_struct(resume_struct)
+
+    if "raw" not in resume_struct:
+        first = resume_doc.paragraphs[0]
+        if not first.text.strip():
+            first.text = sender_name
+        if not any("Email:" in p.text for p in resume_doc.paragraphs):
+            resume_doc.paragraphs.insert(1, resume_doc.add_paragraph(f"Email: {sender_email} | Phone: {sender_phone}"))
+
+    cover_doc = DocxDocument()
+    style_doc(cover_doc)
+    cover_doc.add_paragraph(sender_name).bold = True
+    cover_doc.add_paragraph(f"Email: {sender_email} | Phone: {sender_phone}")
+    cover_doc.add_paragraph("")
+    for para in cover_text.split("\n"):
+        if para.strip():
+            cover_doc.add_paragraph(para.strip())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        resume_path = os.path.join(tmp, "resume.docx")
+        cover_path = os.path.join(tmp, "cover_letter.docx")
+        zip_path = os.path.join(tmp, "resume_package.zip")
+
+        resume_doc.save(resume_path)
+        cover_doc.save(cover_path)
+        convert(resume_path, resume_path.replace(".docx", ".pdf"))
+        convert(cover_path, cover_path.replace(".docx", ".pdf"))
+
+        if email_to:
+            email_resume_package(
+                to_addr=email_to,
+                from_addr=sender_email,
+                subject="Your Résumé + Cover Letter",
+                body="Attached are your generated files.",
+                attachments=[
+                    resume_path,
+                    cover_path,
+                    resume_path.replace(".docx", ".pdf"),
+                    cover_path.replace(".docx", ".pdf")
+                ]
+            )
+
+        with zipfile.ZipFile(zip_path, "w") as zipf:
+            zipf.write(resume_path, arcname="resume.docx")
+            zipf.write(cover_path, arcname="cover_letter.docx")
+            zipf.write(resume_path.replace(".docx", ".pdf"), arcname="resume.pdf")
+            zipf.write(cover_path.replace(".docx", ".pdf"), arcname="cover_letter.pdf")
+
+        return FileResponse(zip_path, media_type="application/zip", filename="resume_package.zip")
